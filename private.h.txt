@@ -1,0 +1,19 @@
+/* Network parameters */
+const char* WIFI_SSID = "YOUR_SSID";
+const char* WIFI_PASS = "YOUR_PASSWORD";
+const char* HOST_IP = "YOUR_HOST_IPADDRESS";
+const char* APP_PATH = "YOUR_WEBAPP_PATH";
+
+/* blank for you
+const char* WIFI_SSID = "";
+const char* WIFI_PASS = "";
+const char* HOST_IP = "";
+const char* APP_PATH = "/";
+ */
+
+/* sample
+const char* WIFI_SSID = "HOGE";
+const char* WIFI_PASS = "FUGA";
+const char* HOST_IP = "192.168.0.1";
+const char* APP_PATH = "/cgi-bin/js_host.cgi?dat=";
+ */
