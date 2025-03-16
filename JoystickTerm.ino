@@ -2,6 +2,7 @@
   JoystickTerm.ino
   AV controller via Wi-Fi and BLE with Arduino and ESP32-WROOM-32E
   copyright (c) by @pado3@mstdn.jp
+  r2.0 2025/03/16 implement light sleep, add F5(reload) on opt+space
   r1.0 2025/03/13 initial release
 
   Note:
@@ -24,19 +25,18 @@
 BleCombo bleCombo;
 
 // global and notable parameters
-String THIS_PROGRAM = "\n===== start JoystickTerm r1.0 by @pado3@mstdn.jp 2025/03/13 =====";
+String THIS_PROGRAM = "\n===== start JoystickTerm r2.0 by @pado3@mstdn.jp 2025/03/16 =====";
 uint32_t WDT_TIMEOUT_NORMAL = 15000;  // watchdog for normal condition, 15sec in msec
 uint32_t WDT_TIMEOUT_CONNECT = 1000;  // watchdog for connection, 1sec in msec
 uint32_t WDT_TIMEOUT = WDT_TIMEOUT_NORMAL;
 hw_timer_t *WD_timer = NULL;
-uint32_t WIFI_TIMEOUT = 60000;        // 1min in msec
-uint32_t BLE_TIMEOUT = 120000;        // 2min in msec
+uint32_t SLEEP_TIMEOUT = 120000;      // 2min in msec
 uint32_t CONN_TIMEOUT = 15000;        // 15sec in msec
-uint32_t WIFI_timer = 0;    // msec
-uint32_t BLE_timer = 0;     // msec
+uint32_t SLEEP_timer = 0;   // msec
 uint16_t LOOP_COUNT = 0;    // loop() counter, 0-1000
 uint8_t REFRESH_RATE = 20;  // Hz, too fast(~30), cannot move cursor
 uint8_t WAIT_KEY = 500;     // prevent key chattering, msec
+uint8_t TOUCH_MARGIN = 2;   // Touch sensor CAL value to threshold margin
 String TV_VOL_UP = "1A";    // IR remocon code of TV, use with web app
 String TV_VOL_DOWN = "1E";
 
@@ -60,6 +60,8 @@ uint8_t vol_up = 22;  // IO32 of ESP32, code 17
 uint8_t vol_dn = 32;  // IO22 of ESP32, code 18
 // option key
 uint8_t option = 23;  // IO23 of ESP32(scroll, shift), no key code
+// touch sensor
+uint8_t touch = T2;   // IO2 of ESP32 for touch detection
 // ADC input
 uint8_t js_x = 39;    // IO39 of ESP32, SVN
 uint8_t js_y = 36;    // IO36 of ESP32, SVP
@@ -102,8 +104,7 @@ void setup() {
   joystick_cal();   // 1sec calibration
   scan_wifi();      // scan first for fast connection
   disconnect_wifi();
-  WIFI_timer = millis();  // initialize connection timer
-  BLE_timer = millis();
+  SLEEP_timer = millis(); // initialize timer 
 }
 
 void loop() {
@@ -114,34 +115,27 @@ void loop() {
     String CMD = String(cmd, HEX);  // compatible TV remote command
     send_wifi_command(CMD);
     delay(WAIT_KEY);
-    WIFI_timer = millis();  // reset WiFi timer
+    SLEEP_timer = millis(); // reset SLEEP timer
     LOOP_COUNT = 0;
   } else if (11 <= cmd && cmd <= 18) {  // command via BLE
     send_ble_command(cmd);
     delay(WAIT_KEY);
-    BLE_timer = millis();  // reset BLE timer
+    SLEEP_timer = millis(); // reset SLEEP timer
     LOOP_COUNT = 0;
   }
-  if (((millis() - BLE_timer) > BLE_TIMEOUT)
-      && (bleCombo.isConnected())) {
-    Serial.print(F("BLE Timeout occurs. "));
-    disconnect_ble();   // reboot in this routine
-    // LOOP_COUNT = 0;
-  }
-  if (((millis() - WIFI_timer) > WIFI_TIMEOUT)
-      && (WiFi.status() == WL_CONNECTED)) {
-    Serial.print(F("Wi-Fi Timeout occurs. "));
-    disconnect_wifi(); 
+  if ((millis() - SLEEP_timer) > SLEEP_TIMEOUT) {
+    Serial.println(F("SLEEP Timeout occurs. "));
+    disconnect_wifi();
+    light_sleep();
     LOOP_COUNT = 0;
   }
   delay(int(1000/REFRESH_RATE));
   if (LOOP_COUNT % 100 == 0) {
-    if (LOOP_COUNT == 1000) {
-      LOOP_COUNT = 0;
+    if (LOOP_COUNT % 1000 == 0) {
       Serial.println();
     }
-    Serial.print(int(LOOP_COUNT));
-  } else if (LOOP_COUNT % 10 == 0) {
+    Serial.print(LOOP_COUNT);
+  } else if (LOOP_COUNT % REFRESH_RATE == 0) {
     Serial.print(F("."));
   }
   LOOP_COUNT++;
@@ -152,10 +146,43 @@ void ARDUINO_ISR_ATTR resetModule() {
   ESP.restart();
 }
 
+void light_sleep() {
+  // calibrate touch sensor
+  Serial.print(F("calibrate touch sensor before sleep... "));
+  int8_t i = 0;
+  int8_t count = 10;
+  int32_t t_cal = 0;
+  for (i = 0; i < count; i++) {
+    t_cal += touchRead(touch);
+    delay(10);
+  }
+  t_cal = int(t_cal / count) - TOUCH_MARGIN;
+  Serial.print(F("your threshold is:"));
+  Serial.print(t_cal);
+  Serial.println(F(", Wait for touch Zzz."));
+  Serial.flush();
+  for (i = 0; i < 3; i++) {
+    digitalWrite(act, HIGH);
+    delay(100);
+    digitalWrite(act, LOW);
+    delay(100);
+  }
+  touchSleepWakeUpEnable(touch, t_cal);
+  esp_light_sleep_start();
+  Serial.println(F("Wake up!"));
+  SLEEP_timer = millis(); // reset SLEEP timer
+  for (i = 0; i < 3; i++) {
+    digitalWrite(act, HIGH);
+    delay(100);
+    digitalWrite(act, LOW);
+    delay(100);
+  }
+}
+
 void joystick_cal() {
   uint8_t count = 100;
   digitalWrite(act, HIGH);  // work as code starting indicator
-  Serial.println(F("\ncalibrating..."));
+  Serial.print(F("calibrating joystick... "));
   for (uint8_t i = 0; i < count; i++) {
     x_cal += float(analogRead(js_x));
     delay(1000/(2*count));
@@ -167,7 +194,7 @@ void joystick_cal() {
   // tp_v = VBATT/2, direct read the calibrated value
   v_batt = float(analogReadMilliVolts(tp_v))*2/1000;  // global
   digitalWrite(act, LOW);
-  Serial.print(F("CAL completed. x_cal: "));
+  Serial.print(F("completed. x_cal: "));
   Serial.print(x_cal);
   Serial.print(F(" y_cal: "));
   Serial.print(y_cal);
@@ -201,6 +228,7 @@ void scan_wifi() {
   //    const uint8_t *bssid = nullptr
   //  );
   int16_t nSSID = WiFi.scanNetworks(false, false, false, 50);
+  WiFi.disconnect(true);   // turn the Wi-Fi radio off.
   bool scan_flag = false;
   digitalWrite(act, LOW);
   if (nSSID == 0) {
@@ -219,7 +247,7 @@ void scan_wifi() {
         Serial.print("dBm)");
         Serial.print((WiFi.encryptionType(n) == WIFI_AUTH_OPEN)?" ":"*");
         if (WiFi.SSID(n) == WIFI_SSID) {
-          Serial.print(F("<----- your AP found¨"));
+          Serial.print(F("<----- your AP¨"));
           scan_flag = true;
         }
     }
@@ -260,8 +288,10 @@ bool connect_wifi() {
 }
 
 void disconnect_wifi() {
-  Serial.println(F("\ndisconnecting Wi-Fi"));
-  WiFi.disconnect(true);   // turn the Wi-Fi radio off. Error occures if BLE is on
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println(F("disconnecting Wi-Fi"));
+    WiFi.disconnect(true);   // turn the Wi-Fi radio off. Error occures if BLE is on
+  }
 }
 
 void send_wifi_command(String CMD) {
@@ -317,11 +347,13 @@ bool connect_ble() {
   return true;
 }
 
+/* do not use
 void disconnect_ble() {
   Serial.println(F("\ndisconnecting BLE"));
-  // bleCombo.end();  // this cannot power off the BLE, so reboot is needed
+  bleCombo.end();  // this cannot power off the BLE, so reboot is needed
   reboot();
 }
+*/
 
 uint8_t get_command() {
   if (!digitalRead(rp_pwr)){
@@ -376,7 +408,7 @@ void move_cursor() {
   signed char y_move = int(pow(y_value, 3.0) /54e4);
   if (abs(x_move) > 0 || abs(y_move)>0) {
     if (connect_ble()) {
-      BLE_timer = millis();
+      SLEEP_timer = millis(); // reset SLEEP timer
       Serial.print(F("\n x_move:"));
       Serial.print(x_move);
       Serial.print(F(" y_move:"));
@@ -400,7 +432,7 @@ void move_cursor() {
 }
 
 void send_ble_command(uint8_t cmd) {
-  BLE_timer = millis();
+  SLEEP_timer = millis(); // reset SLEEP timer
   bool opt = option_value();
   if(connect_ble()) {
     switch (cmd) {
@@ -426,7 +458,6 @@ void send_ble_command(uint8_t cmd) {
         break;
       case 13:  // vol_up
         if(opt) {
-          WIFI_timer = millis();
           send_wifi_command(TV_VOL_UP);
         } else {
           bleCombo.write(KEY_MEDIA_VOLUME_UP);
@@ -434,7 +465,6 @@ void send_ble_command(uint8_t cmd) {
         break;
       case 14:  // vol_dn
         if(opt) {
-          WIFI_timer = millis();
           send_wifi_command(TV_VOL_DOWN);
         } else {
           bleCombo.write(KEY_MEDIA_VOLUME_DOWN);
@@ -447,8 +477,12 @@ void send_ble_command(uint8_t cmd) {
           bleCombo.write(KEY_ESC);
         }
         break;
-      case 16:  // space
-        bleCombo.print(" ");
+      case 16:  // space(reload)
+        if(opt) {
+          bleCombo.write(KEY_F5);
+        } else {
+          bleCombo.print(" ");
+        }
         break;
       case 17:  // reverse(J)
         if(opt) {
