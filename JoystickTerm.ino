@@ -2,6 +2,7 @@
   JoystickTerm.ino
   AV controller via Wi-Fi and BLE with Arduino and ESP32-WROOM-32E
   copyright (c) by @pado3@mstdn.jp
+  r3.0 2025/03/20 use SPIFFS to store CAL value, and some minor update
   r2.0 2025/03/16 implement light sleep, add F5(reload) on opt+space
   r1.0 2025/03/13 initial release
 
@@ -18,6 +19,7 @@
 */
 
 #include "private.h"
+#include <SPIFFS.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <BleCombo.h>
@@ -25,15 +27,16 @@
 BleCombo bleCombo;
 
 // global and notable parameters
-String THIS_PROGRAM = "\n===== start JoystickTerm r2.0 by @pado3@mstdn.jp 2025/03/16 =====";
+String THIS_PROGRAM = "\n===== start JoystickTerm r3.0 by @pado3@mstdn.jp 2025/03/20 =====";
 uint32_t WDT_TIMEOUT_NORMAL = 15000;  // watchdog for normal condition, 15sec in msec
 uint32_t WDT_TIMEOUT_CONNECT = 1000;  // watchdog for connection, 1sec in msec
+uint32_t WDT_TIMEOUT_FORMAT = 60000;  // watchdog for format SPIFFS, 60sec in msec
 uint32_t WDT_TIMEOUT = WDT_TIMEOUT_NORMAL;
 hw_timer_t *WD_timer = NULL;
 uint32_t SLEEP_TIMEOUT = 120000;      // 2min in msec
 uint32_t CONN_TIMEOUT = 15000;        // 15sec in msec
 uint32_t SLEEP_timer = 0;   // msec
-uint16_t LOOP_COUNT = 0;    // loop() counter, 0-1000
+uint16_t LOOP_COUNT = 0;    // loop() counter: max. SLEEP_TIMEOUT*REFRESH_RATE/1000
 uint8_t REFRESH_RATE = 20;  // Hz, too fast(~30), cannot move cursor
 uint8_t WAIT_KEY = 500;     // prevent key chattering, msec
 uint8_t TOUCH_MARGIN = 2;   // Touch sensor CAL value to threshold margin
@@ -47,7 +50,7 @@ uint8_t act = 12;     // IO12 of ESP32
 uint8_t rp_pwr = 15;  // IO15 of ESP32, code 1
 uint8_t tv_pwr = 16;  // IO16 of ESP32, code 2
 uint8_t tv_src = 17;  // IO17 of ESP32, code 3
-uint8_t sp_src =  5;  // IO5  of ESP32, code 4
+uint8_t sp_src = 5;   // IO5  of ESP32, code 4
 // BLE macro
 uint8_t firefox = 4;  // IO4  of ESP32, code 11
 // BLE control
@@ -59,7 +62,7 @@ uint8_t escape = 0;   // IO0 of ESP32, BOOT for programing, code 16
 uint8_t vol_up = 22;  // IO32 of ESP32, code 17
 uint8_t vol_dn = 32;  // IO22 of ESP32, code 18
 // option key
-uint8_t option = 23;  // IO23 of ESP32(scroll, shift), no key code
+uint8_t option = 23;  // IO23 of ESP32, no key code (scroll, option)
 // touch sensor
 uint8_t touch = T2;   // IO2 of ESP32 for touch detection
 // ADC input
@@ -103,7 +106,6 @@ void setup() {
   // Serial.println("START " __FILE__ " from " __DATE__ " " __TIME__);
   joystick_cal();   // 1sec calibration
   scan_wifi();      // scan first for fast connection
-  disconnect_wifi();
   SLEEP_timer = millis(); // initialize timer 
 }
 
@@ -149,23 +151,23 @@ void ARDUINO_ISR_ATTR resetModule() {
 void light_sleep() {
   // calibrate touch sensor
   Serial.print(F("calibrate touch sensor before sleep... "));
-  int8_t i = 0;
-  int8_t count = 10;
-  int32_t t_cal = 0;
+  uint8_t i = 0;
+  uint8_t count = 10;
+  uint16_t t_cal = 0;
   for (i = 0; i < count; i++) {
     t_cal += touchRead(touch);
     delay(10);
   }
   t_cal = int(t_cal / count) - TOUCH_MARGIN;
-  Serial.print(F("your threshold is:"));
+  Serial.print(F("your threshold is: "));
   Serial.print(t_cal);
   Serial.println(F(", Wait for touch Zzz."));
   Serial.flush();
   for (i = 0; i < 3; i++) {
     digitalWrite(act, HIGH);
-    delay(100);
+    delay(50);
     digitalWrite(act, LOW);
-    delay(100);
+    delay(50);
   }
   touchSleepWakeUpEnable(touch, t_cal);
   esp_light_sleep_start();
@@ -173,28 +175,81 @@ void light_sleep() {
   SLEEP_timer = millis(); // reset SLEEP timer
   for (i = 0; i < 3; i++) {
     digitalWrite(act, HIGH);
-    delay(100);
+    delay(50);
     digitalWrite(act, LOW);
-    delay(100);
+    delay(50);
   }
 }
 
 void joystick_cal() {
   uint8_t count = 100;
   digitalWrite(act, HIGH);  // work as code starting indicator
-  Serial.print(F("calibrating joystick... "));
-  for (uint8_t i = 0; i < count; i++) {
-    x_cal += float(analogRead(js_x));
-    delay(1000/(2*count));
-    y_cal += float(analogRead(js_y));
-    delay(1000/(2*count));
+  // use SPIFFS to store CAL data
+  WDT_TIMEOUT = WDT_TIMEOUT_FORMAT;
+  timerWrite(WD_timer, 0);  // reset WDT
+  timerAlarmWrite(WD_timer, WDT_TIMEOUT*1000, false); //set time in usec
+  SPIFFS.begin(true); // Format filesystem at the first time, need 40sec
+  WDT_TIMEOUT = WDT_TIMEOUT_NORMAL;
+  timerWrite(WD_timer, 0);  // reset WDT
+  timerAlarmWrite(WD_timer, WDT_TIMEOUT*1000, false); //set time in usec
+  File fr = SPIFFS.open("/js.dat"); // read first
+  if (fr && !option_value()) {  // file exist and option is not pressed
+    Serial.print(F("read CAL data from file. (x_cal*"));
+    Serial.print(count);
+    Serial.print(F(": "));
+    char c;
+    String buf = "";
+    while(fr.available()) {
+      c = fr.read();
+      if (c != '\n') {
+        buf += String(c);
+      } else {
+        x_cal = buf.toFloat();
+        Serial.print(int(x_cal));
+        buf = "";
+      }
+    }
+    y_cal = buf.toFloat();
+    Serial.print(F(", y_cal*"));
+    Serial.print(count);
+    Serial.print(F(": "));
+    Serial.print(int(y_cal));
+    Serial.println(F(")"));
+    fr.close();
+  } else {  // file not exist or option is pressed
+    File fw = SPIFFS.open("/js.dat", FILE_WRITE); // clear the file
+    Serial.println(F("CAL file is not exist or option key pressed."));
+    // proceed calibration
+    Serial.print(F("calibrating joystick"));
+    for (uint8_t i = 0; i < count; i++) {
+      x_cal += float(analogRead(js_x)); // analogRead() 0-1023
+      delay(1000/(2*count));
+      y_cal += float(analogRead(js_y));
+      delay(1000/(2*count));
+      if (i % 5 == 0) {
+        Serial.print(F("."));
+      }
+    }
+    // store CAL data
+    Serial.print(F("\nwrite CAL data to file. (x_cal*"));
+    Serial.print(count);
+    Serial.print(F(": "));
+    Serial.print(int(x_cal));
+    Serial.print(F(", y_cal*"));
+    Serial.print(count);
+    Serial.print(F(": "));
+    Serial.print(int(y_cal));
+    Serial.println(F(")"));
+    fw.println(String(int(x_cal)));
+    fw.print(String(int(y_cal)));
+    fw.close();
   }
   x_cal /= count;
   y_cal /= count;
   // tp_v = VBATT/2, direct read the calibrated value
   v_batt = float(analogReadMilliVolts(tp_v))*2/1000;  // global
   digitalWrite(act, LOW);
-  Serial.print(F("completed. x_cal: "));
+  Serial.print(F("read or proceed CAL completed. x_cal: "));
   Serial.print(x_cal);
   Serial.print(F(" y_cal: "));
   Serial.print(y_cal);
@@ -217,7 +272,7 @@ void reboot() {
 
 void scan_wifi() {
   digitalWrite(act, HIGH);
-  Serial.print("Scanning Wi-Fi... ");
+  Serial.print(F("Scanning Wi-Fi... "));
   //  int16_t scanNetworks(
   //    bool async = false, 
   //    bool show_hidden = false, 
@@ -235,19 +290,19 @@ void scan_wifi() {
     Serial.println(F("no AP found, but continue"));
   } else {
     Serial.print(nSSID);
-    Serial.print(" APs found");
+    Serial.print(F(" APs found"));
     for (int n = 0; n < nSSID; n++) {
         // Print SSID and RSSI for each network found
         Serial.println();
         Serial.print(n + 1);
-        Serial.print(": ");
+        Serial.print(F(": "));
         Serial.print(WiFi.SSID(n));
-        Serial.print(" (");
+        Serial.print(F(" ("));
         Serial.print(WiFi.RSSI(n));
-        Serial.print("dBm)");
+        Serial.print(F("dBm)"));
         Serial.print((WiFi.encryptionType(n) == WIFI_AUTH_OPEN)?" ":"*");
         if (WiFi.SSID(n) == WIFI_SSID) {
-          Serial.print(F("<----- your AP¨"));
+          Serial.print(F("<----- your AP"));
           scan_flag = true;
         }
     }
@@ -269,13 +324,12 @@ bool connect_wifi() {
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(F("."));
     digitalWrite(act, HIGH);
-    delay(100);
-    Serial.print(F(" "));
+    delay(50);
     digitalWrite(act, LOW);
-    delay(100);
+    delay(50);
     i++;
     // over CONN_TIMEOUT(e.g. host not respond), reboot & scan
-    if (i > CONN_TIMEOUT/200) { reboot(); }
+    if (i > CONN_TIMEOUT/100) { reboot(); }
     timerWrite(WD_timer, 0);  // reset WDT
   }
   // WDT recover to normal condition
@@ -330,13 +384,12 @@ bool connect_ble() {
   while (bleCombo.isConnected() == false) {
     Serial.print(F("."));
     digitalWrite(act, HIGH);
-    delay(100);
-    Serial.print(F(" "));
+    delay(50);
     digitalWrite(act, LOW);
-    delay(100);
+    delay(50);
     i++;
     // over CONN_TIMEOUT(e.g. host not respond), reboot
-    if (i > CONN_TIMEOUT/200) { reboot(); }
+    if (i > CONN_TIMEOUT/100) { reboot(); }
     timerWrite(WD_timer, 0);  // reset WDT
   }
   // WDT recover to normal condition
@@ -357,29 +410,29 @@ void disconnect_ble() {
 
 uint8_t get_command() {
   if (!digitalRead(rp_pwr)){
-    Serial.println(F("\nrp_pwr key pressed"));  return 1;
+    Serial.print(F("\nrp_pwr key pressed "));  return 1;
   } else if (!digitalRead(tv_pwr)){
-    Serial.println(F("\ntv_pwr key pressed"));  return 2;
+    Serial.print(F("\ntv_pwr key pressed "));  return 2;
   } else if (!digitalRead(tv_src)){
-    Serial.println(F("\ntv_src key pressed"));  return 3;
+    Serial.print(F("\ntv_src key pressed "));  return 3;
   } else if (!digitalRead(sp_src)){
-    Serial.println(F("\nsp_src key pressed"));  return 4;
+    Serial.print(F("\nsp_src key pressed "));  return 4;
   } else if (!digitalRead(firefox)){
-    Serial.println(F("\nfirefox key pressed")); return 11;
+    Serial.print(F("\nfirefox key pressed ")); return 11;
   } else if (!digitalRead(click)){
-    Serial.println(F("\nclick key pressed"));   return 12;
+    Serial.print(F("\nclick key pressed "));   return 12;
   } else if (!digitalRead(vol_up)){
-    Serial.println(F("\nvol_up key pressed"));  return 13;
+    Serial.print(F("\nvol_up key pressed "));  return 13;
   } else if (!digitalRead(vol_dn)){
-    Serial.println(F("\nvol_dn key pressed"));  return 14;
+    Serial.print(F("\nvol_dn key pressed "));  return 14;
   } else if (!digitalRead(escape)){
-    Serial.println(F("\nescape key pressed"));  return 15;
+    Serial.print(F("\nescape key pressed "));  return 15;
   } else if (!digitalRead(space)){
-    Serial.println(F("\nspace key pressed"));   return 16;
+    Serial.print(F("\nspace key pressed "));   return 16;
   } else if (!digitalRead(reverse)){
-    Serial.println(F("\nreverse key pressed")); return 17;
+    Serial.print(F("\nreverse key pressed ")); return 17;
   } else if (!digitalRead(forward)){
-    Serial.println(F("\nforward key pressed")); return 18;
+    Serial.print(F("\nforward key pressed ")); return 18;
   } else {
                                                 return 0;
   }
@@ -388,14 +441,13 @@ uint8_t get_command() {
 bool option_value() {
   // pressed: LOW : return true
   if (!digitalRead(option)) {
-    Serial.print(F("\nO "));
+    Serial.print(F("+Option "));
     return true;
   }
   return false;
 }
 
 void move_cursor() {
-  bool wheel = option_value();
   // read all ADC related values
   // x: approx. +/-300, ADC linear region
   float x_value = x_cal - float(analogRead(js_x));
@@ -408,6 +460,7 @@ void move_cursor() {
   signed char y_move = int(pow(y_value, 3.0) /54e4);
   if (abs(x_move) > 0 || abs(y_move)>0) {
     if (connect_ble()) {
+      bool wheel = option_value();
       SLEEP_timer = millis(); // reset SLEEP timer
       Serial.print(F("\n x_move:"));
       Serial.print(x_move);
@@ -418,7 +471,7 @@ void move_cursor() {
       Serial.print(F(" VBATT:"));
       Serial.print(v_batt);
       Serial.println(F("V"));
-      // if option is pressed, wheel is active
+      // if option is pressed, wheel is true = active
       if (wheel) {
         // move: x, y, v-wheel, h-wheel. wheel direction is my preference
         bleCombo.move(0, 0, -y_move/25, -x_move/25);  // wheel 4 step
@@ -433,8 +486,8 @@ void move_cursor() {
 
 void send_ble_command(uint8_t cmd) {
   SLEEP_timer = millis(); // reset SLEEP timer
-  bool opt = option_value();
   if(connect_ble()) {
+    bool opt = option_value();
     switch (cmd) {
       case 11:  // Firefox macro
         bleCombo.write(KEY_LEFT_GUI);
@@ -470,9 +523,13 @@ void send_ble_command(uint8_t cmd) {
           bleCombo.write(KEY_MEDIA_VOLUME_DOWN);
         }
         break;
-      case 15:  // escape(F)
+      case 15:  // escape(command+w)
         if(opt) {
-          bleCombo.print("f");  // full screen with RugbyPass TV
+          // bleCombo.print("f");  // full screen with RugbyPass TV
+          bleCombo.press(KEY_LEFT_CTRL); // Close TAB
+          bleCombo.print("w");
+          delay(100);
+          bleCombo.releaseAll();
         } else {
           bleCombo.write(KEY_ESC);
         }
@@ -501,10 +558,10 @@ void send_ble_command(uint8_t cmd) {
     }
     uint8_t batt_percent = int(100*(v_batt - batt_min)/(batt_max - batt_min));
     // note: in DEBUG, v_batt~5.2V. 
-    //        then 100*(5.2-3.4)/(4.2-3.4)=225 < 255. 255=5.44V
+    //        then 100*(5.2-3.4)/(4.2-3.4)=225 < 255. 255=5.44V, this is unrealistic.
     if (batt_percent < 0) {batt_percent = 0;}
     if (100 < batt_percent) {batt_percent = 100;}
-    Serial.print(F("battery level: "));
+    Serial.print(F(", battery level: "));
     Serial.print(batt_percent);
     Serial.println(F("%"));
     bleCombo.setBatteryLevel(batt_percent);
