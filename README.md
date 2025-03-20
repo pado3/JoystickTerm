@@ -11,3 +11,6 @@ https://pado.tea-nifty.com/top/2025/03/post-ffeb3e.html
 
 (2nd release : implement light sleep, add F5(reload) on opt+space)<br />
 https://pado.tea-nifty.com/top/2025/03/post-8253f0.html
+
+(3rd release : uses onboard flash for CAL data storage<br />
+https://pado.tea-nifty.com/top/2025/03/post-d9c3f5.html
